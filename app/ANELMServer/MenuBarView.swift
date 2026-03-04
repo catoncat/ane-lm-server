@@ -36,11 +36,6 @@ struct MenuBarView: View {
         }
         .padding()
         .frame(width: 300)
-        .onAppear {
-            if downloader.modelExists && !server.isRunning {
-                server.start(modelPath: downloader.modelPath)
-            }
-        }
     }
 
     // MARK: - Header

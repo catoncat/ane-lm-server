@@ -15,6 +15,9 @@ class ServerManager: ObservableObject {
 
     var apiBaseURL: String { "http://\(host):\(port)/v1" }
 
+    /// True from proc.run() until health check succeeds or process dies.
+    /// Prevents duplicate spawns during the startup window.
+    private var isStarting = false
     private var process: Process?
     private var healthTimer: Timer?
 
@@ -38,8 +41,9 @@ class ServerManager: ObservableObject {
     }
 
     func start(modelPath: URL) {
-        guard !isRunning else { return }
+        guard !isRunning && !isStarting else { return }
         lastError = nil
+        isStarting = true
 
         let binary = serverBinaryURL
         guard FileManager.default.fileExists(atPath: binary.path) else {
@@ -69,6 +73,7 @@ class ServerManager: ObservableObject {
         proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
                 self?.isRunning = false
+                self?.isStarting = false
                 if p.terminationStatus != 0 && p.terminationStatus != 15 {
                     self?.statusText = "Crashed (exit \(p.terminationStatus))"
                 } else {
@@ -84,6 +89,7 @@ class ServerManager: ObservableObject {
             statusText = "Starting..."
             startHealthPolling()
         } catch {
+            isStarting = false
             lastError = error.localizedDescription
             statusText = "Failed to start"
         }
@@ -95,6 +101,7 @@ class ServerManager: ObservableObject {
         process?.terminate()
         process = nil
         isRunning = false
+        isStarting = false
         statusText = "Stopped"
     }
 
@@ -113,6 +120,7 @@ class ServerManager: ObservableObject {
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                 if !isRunning {
                     isRunning = true
+                    isStarting = false
                     statusText = "Running on :\(port)"
                 }
             }

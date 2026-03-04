@@ -185,6 +185,14 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
         return;
     }
 
+    // Log request summary
+    int msg_count = (int)body["messages"].size();
+    bool has_tools_field = body.contains("tools") && body["tools"].is_array();
+    fprintf(stderr, "[req] %d messages, stream=%s, tools=%s\n",
+            msg_count,
+            body.value("stream", false) ? "true" : "false",
+            has_tools_field ? std::to_string(body["tools"].size()).c_str() : "none");
+
     // Parse messages
     std::vector<std::pair<std::string, std::string>> messages;
     for (auto& m : body["messages"]) {
@@ -211,11 +219,16 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
     // Parse parameters — accept all standard OpenAI fields
     int max_tokens = body.value("max_tokens", 0);
     if (max_tokens == 0) max_tokens = body.value("max_completion_tokens", 0);
+    if (max_tokens <= 0) max_tokens = 512; // sensible default for small models
     float temperature = body.value("temperature", 0.6f);
     float rep_penalty = body.value("repetition_penalty", 1.2f);
     float freq_penalty = body.value("frequency_penalty", 0.1f);
     bool stream = body.value("stream", false);
     bool enable_thinking = body.value("enable_thinking", false);
+    bool include_usage = false;
+    if (stream && body.contains("stream_options") && body["stream_options"].is_object()) {
+        include_usage = body["stream_options"].value("include_usage", false);
+    }
     // Accept but note: top_p, presence_penalty, seed, logit_bias, n are parsed
     // but not all are supported by the ANE-LM sampler
     // (they won't cause errors, just won't have effect)
@@ -271,7 +284,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
         res.set_chunked_content_provider(
             "text/event-stream",
             [messages = std::move(messages), max_tokens, enable_thinking,
-             sampling, completion_id, created, tools_json, has_tools]
+             sampling, completion_id, created, tools_json, has_tools, include_usage]
             (size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lock(g_model_mutex);
 
@@ -281,11 +294,27 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                 // For tool call detection in streaming, accumulate full text
                 std::string accumulated_text;
                 bool tool_call_detected = false;
+                bool first_chunk = true;
+
+                // Send initial chunk with role (OpenAI spec: first chunk carries role)
+                {
+                    json chunk = {
+                        {"id", completion_id},
+                        {"object", "chat.completion.chunk"},
+                        {"created", created},
+                        {"model", g_model_id},
+                        {"choices", json::array({
+                            {{"index", 0}, {"delta", {{"role", "assistant"}, {"content", ""}}}, {"finish_reason", nullptr}}
+                        })}
+                    };
+                    std::string data = "data: " + chunk.dump() + "\n\n";
+                    sink.write(data.c_str(), data.size());
+                }
 
                 stream_generate(*g_model, g_tokenizer, messages,
                     max_tokens, enable_thinking, sampling,
                     [&sink, &completion_id, &created, &accumulated_text,
-                     &tool_call_detected, has_tools]
+                     &tool_call_detected, &first_chunk, has_tools, include_usage]
                     (const GenerationResponse& r) {
                         if (r.token == -1) {
                             // End of generation
@@ -305,13 +334,14 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                                 {"arguments", calls[i].arguments.dump()}
                                             }}
                                         };
+                                        json delta = {{"tool_calls", json::array({tc})}};
                                         json chunk = {
                                             {"id", completion_id},
                                             {"object", "chat.completion.chunk"},
                                             {"created", created},
                                             {"model", g_model_id},
                                             {"choices", json::array({
-                                                {{"index", 0}, {"delta", {{"tool_calls", json::array({tc})}}}, {"finish_reason", nullptr}}
+                                                {{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
                                             })}
                                         };
                                         std::string data = "data: " + chunk.dump() + "\n\n";
@@ -320,6 +350,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                 }
                             }
 
+                            // Final chunk with finish_reason
                             std::string finish = tool_call_detected ? "tool_calls" : "stop";
                             json chunk = {
                                 {"id", completion_id},
@@ -328,15 +359,29 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                 {"model", g_model_id},
                                 {"choices", json::array({
                                     {{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}
-                                })},
-                                {"usage", {
-                                    {"prompt_tokens", r.prompt_tokens},
-                                    {"completion_tokens", r.generation_tokens},
-                                    {"total_tokens", r.prompt_tokens + r.generation_tokens}
-                                }}
+                                })}
                             };
                             std::string data = "data: " + chunk.dump() + "\n\n";
                             sink.write(data.c_str(), data.size());
+
+                            // Usage chunk (only when stream_options.include_usage is true)
+                            if (include_usage) {
+                                json usage_chunk = {
+                                    {"id", completion_id},
+                                    {"object", "chat.completion.chunk"},
+                                    {"created", created},
+                                    {"model", g_model_id},
+                                    {"choices", json::array()},
+                                    {"usage", {
+                                        {"prompt_tokens", r.prompt_tokens},
+                                        {"completion_tokens", r.generation_tokens},
+                                        {"total_tokens", r.prompt_tokens + r.generation_tokens}
+                                    }}
+                                };
+                                std::string udata = "data: " + usage_chunk.dump() + "\n\n";
+                                sink.write(udata.c_str(), udata.size());
+                            }
+
                             sink.write("data: [DONE]\n\n", 14);
                             return;
                         }
@@ -346,8 +391,6 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
 
                             // If tools are present, buffer output (don't stream raw tool_call XML)
                             if (has_tools && accumulated_text.find("<tool_call>") != std::string::npos) {
-                                // Detected tool call start, stop streaming content
-                                // (will be parsed and sent as tool_calls at end)
                                 return;
                             }
 
