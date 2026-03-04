@@ -30,6 +30,12 @@ extern "C" void  objc_autoreleasePoolPop(void*);
 using json = nlohmann::json;
 using namespace ane_lm;
 
+// Safe JSON serialization: replace invalid UTF-8 bytes instead of throwing.
+// The tokenizer may produce partial byte sequences for emoji/CJK tokens.
+static std::string safe_dump(const json& j) {
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
 // --- Globals ---
 static std::unique_ptr<LLMModel> g_model;
 static Tokenizer g_tokenizer;
@@ -163,7 +169,7 @@ static void handle_models(const httplib::Request&, httplib::Response& res) {
             }
         })}
     };
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(safe_dump(resp), "application/json");
 }
 
 // --- /v1/chat/completions ---
@@ -307,7 +313,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                             {{"index", 0}, {"delta", {{"role", "assistant"}, {"content", ""}}}, {"finish_reason", nullptr}}
                         })}
                     };
-                    std::string data = "data: " + chunk.dump() + "\n\n";
+                    std::string data = "data: " + safe_dump(chunk) + "\n\n";
                     sink.write(data.c_str(), data.size());
                 }
 
@@ -344,7 +350,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                                 {{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
                                             })}
                                         };
-                                        std::string data = "data: " + chunk.dump() + "\n\n";
+                                        std::string data = "data: " + safe_dump(chunk) + "\n\n";
                                         sink.write(data.c_str(), data.size());
                                     }
                                 }
@@ -361,7 +367,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                     {{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}
                                 })}
                             };
-                            std::string data = "data: " + chunk.dump() + "\n\n";
+                            std::string data = "data: " + safe_dump(chunk) + "\n\n";
                             sink.write(data.c_str(), data.size());
 
                             // Usage chunk (only when stream_options.include_usage is true)
@@ -378,7 +384,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                         {"total_tokens", r.prompt_tokens + r.generation_tokens}
                                     }}
                                 };
-                                std::string udata = "data: " + usage_chunk.dump() + "\n\n";
+                                std::string udata = "data: " + safe_dump(usage_chunk) + "\n\n";
                                 sink.write(udata.c_str(), udata.size());
                             }
 
@@ -403,7 +409,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                     {{"index", 0}, {"delta", {{"content", r.text}}}, {"finish_reason", nullptr}}
                                 })}
                             };
-                            std::string data = "data: " + chunk.dump() + "\n\n";
+                            std::string data = "data: " + safe_dump(chunk) + "\n\n";
                             sink.write(data.c_str(), data.size());
                         }
                     },
@@ -476,7 +482,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                         {"total_tokens", last.prompt_tokens + last.generation_tokens}
                     }}
                 };
-                res.set_content(resp.dump(), "application/json");
+                res.set_content(safe_dump(resp), "application/json");
                 return;
             }
         }
@@ -500,7 +506,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
             }}
         };
 
-        res.set_content(resp.dump(), "application/json");
+        res.set_content(safe_dump(resp), "application/json");
     }
 }
 
