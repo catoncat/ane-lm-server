@@ -13,6 +13,8 @@
 #include <vector>
 #include <utility>
 #include <random>
+#include <regex>
+#include <sstream>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -44,9 +46,109 @@ static std::string make_completion_id() {
     return id;
 }
 
+static std::string make_tool_call_id() {
+    static std::mt19937 rng(std::random_device{}());
+    static const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    std::string id = "call_";
+    for (int i = 0; i < 24; i++) {
+        id += chars[rng() % (sizeof(chars) - 1)];
+    }
+    return id;
+}
+
 static int64_t now_unix() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// --- Tool call parsing ---
+// Qwen3.5 outputs tool calls in this format:
+//   <tool_call>
+//   <function=func_name>
+//   <parameter=param_name>
+//   value
+//   </parameter>
+//   </function>
+//   </tool_call>
+
+struct ParsedToolCall {
+    std::string name;
+    json arguments;
+};
+
+static std::vector<ParsedToolCall> parse_tool_calls(const std::string& text) {
+    std::vector<ParsedToolCall> calls;
+
+    // Find all <tool_call>...</tool_call> blocks
+    size_t pos = 0;
+    while (true) {
+        size_t start = text.find("<tool_call>", pos);
+        if (start == std::string::npos) break;
+        size_t end = text.find("</tool_call>", start);
+        if (end == std::string::npos) break;
+
+        std::string block = text.substr(start + 11, end - start - 11);
+        pos = end + 12;
+
+        // Extract function name: <function=NAME>
+        size_t fn_start = block.find("<function=");
+        if (fn_start == std::string::npos) continue;
+        size_t fn_name_start = fn_start + 10;
+        size_t fn_name_end = block.find(">", fn_name_start);
+        if (fn_name_end == std::string::npos) continue;
+        std::string func_name = block.substr(fn_name_start, fn_name_end - fn_name_start);
+
+        size_t fn_close = block.find("</function>", fn_name_end);
+        if (fn_close == std::string::npos) fn_close = block.size();
+        std::string fn_body = block.substr(fn_name_end + 1, fn_close - fn_name_end - 1);
+
+        // Extract parameters: <parameter=NAME>VALUE</parameter>
+        json args = json::object();
+        size_t p = 0;
+        while (true) {
+            size_t pstart = fn_body.find("<parameter=", p);
+            if (pstart == std::string::npos) break;
+            size_t pname_start = pstart + 11;
+            size_t pname_end = fn_body.find(">", pname_start);
+            if (pname_end == std::string::npos) break;
+            std::string param_name = fn_body.substr(pname_start, pname_end - pname_start);
+
+            size_t pval_start = pname_end + 1;
+            size_t pval_end = fn_body.find("</parameter>", pval_start);
+            if (pval_end == std::string::npos) break;
+            std::string param_val = fn_body.substr(pval_start, pval_end - pval_start);
+
+            // Trim whitespace
+            while (!param_val.empty() && (param_val.front() == '\n' || param_val.front() == ' '))
+                param_val.erase(param_val.begin());
+            while (!param_val.empty() && (param_val.back() == '\n' || param_val.back() == ' '))
+                param_val.pop_back();
+
+            // Try to parse as JSON, otherwise store as string
+            try {
+                args[param_name] = json::parse(param_val);
+            } catch (...) {
+                args[param_name] = param_val;
+            }
+
+            p = pval_end + 12;
+        }
+
+        calls.push_back({func_name, args});
+    }
+
+    return calls;
+}
+
+// Extract text content before any <tool_call> block
+static std::string extract_text_before_tool_calls(const std::string& text) {
+    size_t pos = text.find("<tool_call>");
+    if (pos == std::string::npos) return text;
+    std::string before = text.substr(0, pos);
+    // Trim trailing whitespace
+    while (!before.empty() && (before.back() == '\n' || before.back() == ' '))
+        before.pop_back();
+    return before;
 }
 
 // --- /v1/models ---
@@ -83,19 +185,74 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
         return;
     }
 
+    // Parse messages
     std::vector<std::pair<std::string, std::string>> messages;
     for (auto& m : body["messages"]) {
         std::string role = m.value("role", "user");
-        std::string content = m.value("content", "");
+        std::string content;
+        // Handle content as string or array (multimodal format — extract text parts)
+        if (m.contains("content")) {
+            if (m["content"].is_string()) {
+                content = m["content"].get<std::string>();
+            } else if (m["content"].is_array()) {
+                for (auto& part : m["content"]) {
+                    if (part.value("type", "") == "text") {
+                        if (!content.empty()) content += "\n";
+                        content += part.value("text", "");
+                    }
+                }
+            } else if (m["content"].is_null()) {
+                content = "";
+            }
+        }
         messages.push_back({role, content});
     }
 
+    // Parse parameters — accept all standard OpenAI fields
     int max_tokens = body.value("max_tokens", 0);
+    if (max_tokens == 0) max_tokens = body.value("max_completion_tokens", 0);
     float temperature = body.value("temperature", 0.6f);
     float rep_penalty = body.value("repetition_penalty", 1.2f);
     float freq_penalty = body.value("frequency_penalty", 0.1f);
     bool stream = body.value("stream", false);
     bool enable_thinking = body.value("enable_thinking", false);
+    // Accept but note: top_p, presence_penalty, seed, logit_bias, n are parsed
+    // but not all are supported by the ANE-LM sampler
+    // (they won't cause errors, just won't have effect)
+
+    // Tools support
+    std::string tools_json;
+    bool has_tools = false;
+    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+        tools_json = body["tools"].dump();
+        has_tools = true;
+    }
+
+    // response_format: json_object mode — inject instruction into system message
+    if (body.contains("response_format") && body["response_format"].is_object()) {
+        std::string fmt_type = body["response_format"].value("type", "text");
+        if (fmt_type == "json_object" || fmt_type == "json_schema") {
+            // Append JSON instruction to first system message, or prepend one
+            std::string json_instruction = "\n\nYou must respond with valid JSON only. No other text.";
+            if (fmt_type == "json_schema" && body["response_format"].contains("json_schema")) {
+                auto& schema = body["response_format"]["json_schema"];
+                if (schema.contains("schema")) {
+                    json_instruction += "\nThe response must conform to this JSON schema: " + schema["schema"].dump();
+                }
+            }
+            bool found_system = false;
+            for (auto& [role, content] : messages) {
+                if (role == "system") {
+                    content += json_instruction;
+                    found_system = true;
+                    break;
+                }
+            }
+            if (!found_system) {
+                messages.insert(messages.begin(), {"system", "You are a helpful assistant." + json_instruction});
+            }
+        }
+    }
 
     SamplingParams sampling;
     sampling.temperature = temperature;
@@ -114,24 +271,63 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
         res.set_chunked_content_provider(
             "text/event-stream",
             [messages = std::move(messages), max_tokens, enable_thinking,
-             sampling, completion_id, created]
+             sampling, completion_id, created, tools_json, has_tools]
             (size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lock(g_model_mutex);
 
                 void* pool = objc_autoreleasePoolPush();
                 g_model->reset();
 
+                // For tool call detection in streaming, accumulate full text
+                std::string accumulated_text;
+                bool tool_call_detected = false;
+
                 stream_generate(*g_model, g_tokenizer, messages,
                     max_tokens, enable_thinking, sampling,
-                    [&sink, &completion_id, &created](const GenerationResponse& r) {
+                    [&sink, &completion_id, &created, &accumulated_text,
+                     &tool_call_detected, has_tools]
+                    (const GenerationResponse& r) {
                         if (r.token == -1) {
+                            // End of generation
+                            if (has_tools && !tool_call_detected) {
+                                // Check if accumulated text contains tool calls
+                                auto calls = parse_tool_calls(accumulated_text);
+                                if (!calls.empty()) {
+                                    tool_call_detected = true;
+                                    // Send tool call chunks
+                                    for (size_t i = 0; i < calls.size(); i++) {
+                                        json tc = {
+                                            {"index", (int)i},
+                                            {"id", make_tool_call_id()},
+                                            {"type", "function"},
+                                            {"function", {
+                                                {"name", calls[i].name},
+                                                {"arguments", calls[i].arguments.dump()}
+                                            }}
+                                        };
+                                        json chunk = {
+                                            {"id", completion_id},
+                                            {"object", "chat.completion.chunk"},
+                                            {"created", created},
+                                            {"model", g_model_id},
+                                            {"choices", json::array({
+                                                {{"index", 0}, {"delta", {{"tool_calls", json::array({tc})}}}, {"finish_reason", nullptr}}
+                                            })}
+                                        };
+                                        std::string data = "data: " + chunk.dump() + "\n\n";
+                                        sink.write(data.c_str(), data.size());
+                                    }
+                                }
+                            }
+
+                            std::string finish = tool_call_detected ? "tool_calls" : "stop";
                             json chunk = {
                                 {"id", completion_id},
                                 {"object", "chat.completion.chunk"},
                                 {"created", created},
                                 {"model", g_model_id},
                                 {"choices", json::array({
-                                    {{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}
+                                    {{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}
                                 })},
                                 {"usage", {
                                     {"prompt_tokens", r.prompt_tokens},
@@ -144,7 +340,17 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                             sink.write("data: [DONE]\n\n", 14);
                             return;
                         }
+
                         if (!r.text.empty()) {
+                            accumulated_text += r.text;
+
+                            // If tools are present, buffer output (don't stream raw tool_call XML)
+                            if (has_tools && accumulated_text.find("<tool_call>") != std::string::npos) {
+                                // Detected tool call start, stop streaming content
+                                // (will be parsed and sent as tool_calls at end)
+                                return;
+                            }
+
                             json chunk = {
                                 {"id", completion_id},
                                 {"object", "chat.completion.chunk"},
@@ -157,7 +363,8 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                             std::string data = "data: " + chunk.dump() + "\n\n";
                             sink.write(data.c_str(), data.size());
                         }
-                    });
+                    },
+                    tools_json);
 
                 objc_autoreleasePoolPop(pool);
                 sink.done();
@@ -180,11 +387,58 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                 if (r.token == -1) { last = r; return; }
                 if (!r.text.empty()) full_text += r.text;
                 last = r;
-            });
+            },
+            tools_json);
 
         objc_autoreleasePoolPop(pool);
 
-        json resp = {
+        // Check for tool calls in output
+        json resp;
+        if (has_tools) {
+            auto calls = parse_tool_calls(full_text);
+            if (!calls.empty()) {
+                std::string content_before = extract_text_before_tool_calls(full_text);
+                json tool_calls_arr = json::array();
+                for (auto& tc : calls) {
+                    tool_calls_arr.push_back({
+                        {"id", make_tool_call_id()},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", tc.name},
+                            {"arguments", tc.arguments.dump()}
+                        }}
+                    });
+                }
+                json msg = {{"role", "assistant"}, {"tool_calls", tool_calls_arr}};
+                if (!content_before.empty()) {
+                    msg["content"] = content_before;
+                } else {
+                    msg["content"] = nullptr;
+                }
+                resp = {
+                    {"id", completion_id},
+                    {"object", "chat.completion"},
+                    {"created", created},
+                    {"model", g_model_id},
+                    {"choices", json::array({
+                        {
+                            {"index", 0},
+                            {"message", msg},
+                            {"finish_reason", "tool_calls"}
+                        }
+                    })},
+                    {"usage", {
+                        {"prompt_tokens", last.prompt_tokens},
+                        {"completion_tokens", last.generation_tokens},
+                        {"total_tokens", last.prompt_tokens + last.generation_tokens}
+                    }}
+                };
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+        }
+
+        resp = {
             {"id", completion_id},
             {"object", "chat.completion"},
             {"created", created},
