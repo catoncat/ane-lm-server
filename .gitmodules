@@ -1,0 +1,3 @@
+[submodule "vendor/ANE-LM"]
+	path = vendor/ANE-LM
+	url = https://github.com/johnmai-dev/ANE-LM.git
