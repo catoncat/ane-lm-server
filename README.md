@@ -7,6 +7,10 @@ OpenAI-compatible API server for [ANE-LM](https://github.com/johnmai-dev/ANE-LM)
 This project wraps ANE-LM into an HTTP server that speaks the OpenAI API protocol. Any client that supports the OpenAI API (ChatBox, Open WebUI, Cursor, custom apps, etc.) can connect directly.
 
 All inference runs on the **Apple Neural Engine (ANE)**, not CPU or GPU.
+<img width="712" height="398" alt="image" src="https://github.com/user-attachments/assets/9dfd0377-55a5-433f-a98e-4a14eab3b9ea" />
+
+<img width="828" height="846" alt="image" src="https://github.com/user-attachments/assets/4728ae16-55ef-4762-b4cc-229dd534e170" />
+
 
 ## Requirements
 
@@ -59,6 +63,7 @@ curl -N http://localhost:8080/v1/chat/completions \
     "stream": true
   }'
 ```
+
 
 ### `GET /v1/models`
 
