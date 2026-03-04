@@ -4,6 +4,22 @@
 import Foundation
 import Combine
 
+enum MirrorSource: String, CaseIterable, Identifiable {
+    case huggingface = "huggingface.co"
+    case hfMirror = "hf-mirror.com"
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .huggingface: return "HuggingFace"
+        case .hfMirror: return "hf-mirror (CN)"
+        }
+    }
+    func url(repo: String, file: String) -> URL {
+        URL(string: "https://\(rawValue)/\(repo)/resolve/main/\(file)")!
+    }
+}
+
 @MainActor
 class ModelDownloader: NSObject, ObservableObject {
     @Published var progress: Double = 0
@@ -12,6 +28,7 @@ class ModelDownloader: NSObject, ObservableObject {
     @Published var isDownloading = false
     @Published var currentFile: String = ""
     @Published var error: String?
+    @Published var mirror: MirrorSource = .huggingface
 
     // How many files total / completed
     @Published var fileIndex: Int = 0
@@ -65,10 +82,10 @@ class ModelDownloader: NSObject, ObservableObject {
         error = nil
         progress = 0
 
-        // Build file list
+        // Build file list using selected mirror
+        let source = mirror
         pendingFiles = Self.requiredFiles.map { filename in
-            let url = URL(string: "https://huggingface.co/\(repo)/resolve/main/\(filename)")!
-            return (url: url, destName: filename)
+            (url: source.url(repo: repo, file: filename), destName: filename)
         }
 
         fileCount = pendingFiles.count
@@ -115,6 +132,13 @@ class ModelDownloader: NSObject, ObservableObject {
         pendingFiles.removeAll()
         isDownloading = false
         currentFile = ""
+    }
+
+    func deleteModel() {
+        let dir = Self.modelsDirectory
+        try? FileManager.default.removeItem(at: dir)
+        // Recreate empty directory
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 
     static func formatBytes(_ bytes: Int64) -> String {

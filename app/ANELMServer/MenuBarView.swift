@@ -8,6 +8,7 @@ struct MenuBarView: View {
     @EnvironmentObject var downloader: ModelDownloader
 
     @State private var copied = false
+    @State private var showDeleteConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -117,6 +118,20 @@ struct MenuBarView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .tint(server.isRunning ? .red : .green)
+
+                    Button("Delete Model") {
+                        showDeleteConfirm = true
+                    }
+                    .controlSize(.small)
+                    .disabled(server.isRunning)
+                    .alert("Delete Model?", isPresented: $showDeleteConfirm) {
+                        Button("Delete", role: .destructive) {
+                            downloader.deleteModel()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("This will remove all downloaded model files.")
+                    }
                 }
 
                 Spacer()
@@ -126,6 +141,17 @@ struct MenuBarView: View {
                     NSApp.terminate(nil)
                 }
                 .controlSize(.small)
+            }
+
+            // Mirror picker (shown when model not downloaded or downloading)
+            if !downloader.modelExists || downloader.isDownloading {
+                Picker("Mirror", selection: $downloader.mirror) {
+                    ForEach(MirrorSource.allCases) { source in
+                        Text(source.label).tag(source)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(downloader.isDownloading)
             }
         }
         .padding()
