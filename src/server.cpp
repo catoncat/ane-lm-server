@@ -15,6 +15,8 @@
 #include <random>
 #include <regex>
 #include <sstream>
+#include <cctype>
+#include <unordered_map>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -82,27 +84,116 @@ struct ParsedToolCall {
     json arguments;
 };
 
+static json compact_tools_for_model(const json& tools) {
+    json compact = json::array();
+    for (auto& t : tools) {
+        if (!t.is_object()) continue;
+        if (!t.contains("type") || t["type"] != "function") continue;
+        if (!t.contains("function") || !t["function"].is_object()) continue;
+
+        auto& fn = t["function"];
+        std::string name = fn.value("name", "");
+        if (name.empty()) continue;
+
+        json out_fn = {{"name", name}};
+
+        std::string desc = fn.value("description", "");
+        if (!desc.empty()) {
+            if (desc.size() > 160) desc = desc.substr(0, 160);
+            out_fn["description"] = desc;
+        }
+
+        if (fn.contains("parameters") && fn["parameters"].is_object()) {
+            const auto& p = fn["parameters"];
+            json out_params = json::object();
+            out_params["type"] = p.value("type", "object");
+
+            if (p.contains("required") && p["required"].is_array()) {
+                out_params["required"] = p["required"];
+            }
+
+            if (p.contains("properties") && p["properties"].is_object()) {
+                json out_props = json::object();
+                for (auto it = p["properties"].begin(); it != p["properties"].end(); ++it) {
+                    if (!it.value().is_object()) continue;
+                    json one = json::object();
+                    one["type"] = it.value().value("type", "string");
+                    if (it.value().contains("enum") && it.value()["enum"].is_array()) {
+                        one["enum"] = it.value()["enum"];
+                    }
+                    out_props[it.key()] = one;
+                }
+                out_params["properties"] = out_props;
+            }
+
+            out_fn["parameters"] = out_params;
+        }
+
+        compact.push_back({
+            {"type", "function"},
+            {"function", out_fn}
+        });
+    }
+    return compact;
+}
+
+static std::string build_tool_hint(const json& compact_tools) {
+    std::string hint = "Available tools:\n";
+    for (auto& t : compact_tools) {
+        if (!t.is_object() || !t.contains("function")) continue;
+        auto& fn = t["function"];
+        std::string name = fn.value("name", "");
+        if (name.empty()) continue;
+
+        hint += "- " + name + "(";
+        bool first = true;
+        if (fn.contains("parameters") && fn["parameters"].is_object() &&
+            fn["parameters"].contains("properties") && fn["parameters"]["properties"].is_object()) {
+            for (auto it = fn["parameters"]["properties"].begin(); it != fn["parameters"]["properties"].end(); ++it) {
+                if (!first) hint += ", ";
+                hint += it.key();
+                first = false;
+            }
+        }
+        hint += ")\n";
+    }
+    return hint;
+}
+
 static std::vector<ParsedToolCall> parse_tool_calls(const std::string& text) {
     std::vector<ParsedToolCall> calls;
+    auto is_valid_ident = [](const std::string& s) {
+        if (s.empty()) return false;
+        if (!(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+        for (char c : s) {
+            if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+        }
+        return true;
+    };
 
-    // Find all <tool_call>...</tool_call> blocks
-    size_t pos = 0;
-    while (true) {
-        size_t start = text.find("<tool_call>", pos);
-        if (start == std::string::npos) break;
-        size_t end = text.find("</tool_call>", start);
-        if (end == std::string::npos) break;
-
-        std::string block = text.substr(start + 11, end - start - 11);
-        pos = end + 12;
-
+    auto parse_function_from_block = [&is_valid_ident](const std::string& block, std::vector<ParsedToolCall>& out) {
         // Extract function name: <function=NAME>
         size_t fn_start = block.find("<function=");
-        if (fn_start == std::string::npos) continue;
+        if (fn_start == std::string::npos) return;
         size_t fn_name_start = fn_start + 10;
         size_t fn_name_end = block.find(">", fn_name_start);
-        if (fn_name_end == std::string::npos) continue;
-        std::string func_name = block.substr(fn_name_start, fn_name_end - fn_name_start);
+        if (fn_name_end == std::string::npos) return;
+        std::string func_tag = block.substr(fn_name_start, fn_name_end - fn_name_start);
+        std::string func_name = func_tag;
+        std::string inline_sig;
+        size_t sig_start = func_tag.find("(");
+        if (sig_start != std::string::npos) {
+            func_name = func_tag.substr(0, sig_start);
+            inline_sig = func_tag.substr(sig_start + 1);
+            if (!inline_sig.empty() && inline_sig.back() == ')') inline_sig.pop_back();
+        }
+
+        // Trim spaces around function name
+        while (!func_name.empty() && (func_name.front() == ' ' || func_name.front() == '\n'))
+            func_name.erase(func_name.begin());
+        while (!func_name.empty() && (func_name.back() == ' ' || func_name.back() == '\n'))
+            func_name.pop_back();
+        if (func_name.empty()) return;
 
         size_t fn_close = block.find("</function>", fn_name_end);
         if (fn_close == std::string::npos) fn_close = block.size();
@@ -140,7 +231,67 @@ static std::vector<ParsedToolCall> parse_tool_calls(const std::string& text) {
             p = pval_end + 12;
         }
 
-        calls.push_back({func_name, args});
+        // Fallback: parse inline signature in <function=foo(a="x",b=1)>
+        if (args.empty() && !inline_sig.empty()) {
+            size_t s = 0;
+            while (s < inline_sig.size()) {
+                while (s < inline_sig.size() && (inline_sig[s] == ' ' || inline_sig[s] == ',')) s++;
+                if (s >= inline_sig.size()) break;
+                size_t eq = inline_sig.find("=", s);
+                if (eq == std::string::npos) break;
+                std::string key = inline_sig.substr(s, eq - s);
+                while (!key.empty() && key.back() == ' ') key.pop_back();
+
+                size_t vstart = eq + 1;
+                while (vstart < inline_sig.size() && inline_sig[vstart] == ' ') vstart++;
+                if (vstart >= inline_sig.size()) break;
+
+                std::string val;
+                size_t next = std::string::npos;
+                if (inline_sig[vstart] == '"') {
+                    size_t vend = inline_sig.find('"', vstart + 1);
+                    if (vend == std::string::npos) vend = inline_sig.size() - 1;
+                    val = inline_sig.substr(vstart + 1, vend - (vstart + 1));
+                    next = inline_sig.find(',', vend + 1);
+                } else {
+                    size_t vend = inline_sig.find(',', vstart);
+                    if (vend == std::string::npos) vend = inline_sig.size();
+                    val = inline_sig.substr(vstart, vend - vstart);
+                    while (!val.empty() && val.back() == ' ') val.pop_back();
+                    next = (vend < inline_sig.size()) ? vend : std::string::npos;
+                }
+
+                if (is_valid_ident(key)) {
+                    args[key] = val;
+                }
+                if (next == std::string::npos) break;
+                s = next + 1;
+            }
+        }
+
+        out.push_back({func_name, args});
+    };
+
+    // Find all <tool_call>...</tool_call> blocks
+    size_t pos = 0;
+    while (true) {
+        size_t start = text.find("<tool_call>", pos);
+        if (start == std::string::npos) break;
+        size_t end = text.find("</tool_call>", start);
+        if (end == std::string::npos) {
+            // Some models omit </tool_call>; tolerate this and parse until the tail.
+            end = text.size();
+            pos = text.size();
+        } else {
+            pos = end + 12;
+        }
+        std::string block = text.substr(start + 11, end - start - 11);
+        parse_function_from_block(block, calls);
+    }
+
+    // Fallback: some models emit bare <function=...> blocks without <tool_call>.
+    if (calls.empty()) {
+        parse_function_from_block(text, calls);
     }
 
     return calls;
@@ -225,7 +376,6 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
     // Parse parameters — accept all standard OpenAI fields
     int max_tokens = body.value("max_tokens", 0);
     if (max_tokens == 0) max_tokens = body.value("max_completion_tokens", 0);
-    if (max_tokens <= 0) max_tokens = 512; // sensible default for small models
     float temperature = body.value("temperature", 0.6f);
     float rep_penalty = body.value("repetition_penalty", 1.2f);
     float freq_penalty = body.value("frequency_penalty", 0.1f);
@@ -241,10 +391,56 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
 
     // Tools support
     std::string tools_json;
+    std::string tool_hint;
+    std::unordered_map<std::string, int> tool_required_count;
     bool has_tools = false;
     if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
-        tools_json = body["tools"].dump();
+        json compact_tools = compact_tools_for_model(body["tools"]);
+        tools_json = compact_tools.dump();
+        tool_hint = build_tool_hint(compact_tools);
+        for (auto& t : compact_tools) {
+            if (!t.is_object() || !t.contains("function") || !t["function"].is_object()) continue;
+            const auto& fn = t["function"];
+            std::string name = fn.value("name", "");
+            if (name.empty()) continue;
+            int required = 0;
+            if (fn.contains("parameters") && fn["parameters"].is_object() &&
+                fn["parameters"].contains("required") && fn["parameters"]["required"].is_array()) {
+                required = (int)fn["parameters"]["required"].size();
+            }
+            tool_required_count[name] = required;
+        }
         has_tools = true;
+        fprintf(stderr, "[tools] input=%zu compact=%zu bytes\n",
+                body["tools"].dump().size(), tools_json.size());
+        // For this model, full tool chat-template expansion is expensive.
+        // We rely on a compact system instruction instead.
+        tools_json.clear();
+    }
+
+    if (max_tokens <= 0) {
+        // Tool-call rounds should finish quickly; keep default tighter to avoid long hangs.
+        max_tokens = has_tools ? 128 : 512;
+    }
+
+    if (has_tools) {
+        const std::string tool_instruction =
+            "\n\n" + tool_hint +
+            "\nIf you call a tool, output exactly one <tool_call> block with "
+            "<function=...> and <parameter=...>...</parameter>, then end immediately. "
+            "Example:\n<tool_call>\n<function=get_weather>\n<parameter=city>Shanghai</parameter>\n</function>\n</tool_call>\n"
+            "Do not output extra explanation text.";
+        bool found_system = false;
+        for (auto& [role, content] : messages) {
+            if (role == "system") {
+                content += tool_instruction;
+                found_system = true;
+                break;
+            }
+        }
+        if (!found_system) {
+            messages.insert(messages.begin(), {"system", "You are a helpful assistant." + tool_instruction});
+        }
     }
 
     // response_format: json_object mode — inject instruction into system message
@@ -290,7 +486,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
         res.set_chunked_content_provider(
             "text/event-stream",
             [messages = std::move(messages), max_tokens, enable_thinking,
-             sampling, completion_id, created, tools_json, has_tools, include_usage]
+             sampling, completion_id, created, tools_json, has_tools, include_usage, tool_required_count]
             (size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lock(g_model_mutex);
 
@@ -300,7 +496,8 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                 // For tool call detection in streaming, accumulate full text
                 std::string accumulated_text;
                 bool tool_call_detected = false;
-                bool first_chunk = true;
+                bool buffering_tool_call = false;
+                std::vector<ParsedToolCall> detected_tool_calls;
 
                 // Send initial chunk with role (OpenAI spec: first chunk carries role)
                 {
@@ -320,24 +517,34 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                 stream_generate(*g_model, g_tokenizer, messages,
                     max_tokens, enable_thinking, sampling,
                     [&sink, &completion_id, &created, &accumulated_text,
-                     &tool_call_detected, &first_chunk, has_tools, include_usage]
+                     &tool_call_detected, &buffering_tool_call, &detected_tool_calls,
+                     has_tools, include_usage, tool_required_count]
                     (const GenerationResponse& r) {
+                        auto call_is_complete = [&tool_required_count](const ParsedToolCall& c) {
+                            auto it = tool_required_count.find(c.name);
+                            int required = (it == tool_required_count.end()) ? 0 : it->second;
+                            if (required <= 0) return true;
+                            return !c.arguments.empty();
+                        };
+
                         if (r.token == -1) {
                             // End of generation
-                            if (has_tools && !tool_call_detected) {
-                                // Check if accumulated text contains tool calls
-                                auto calls = parse_tool_calls(accumulated_text);
-                                if (!calls.empty()) {
-                                    tool_call_detected = true;
+                            if (has_tools) {
+                                if (!tool_call_detected) {
+                                    detected_tool_calls = parse_tool_calls(accumulated_text);
+                                    tool_call_detected = !detected_tool_calls.empty();
+                                }
+
+                                if (tool_call_detected && !detected_tool_calls.empty()) {
                                     // Send tool call chunks
-                                    for (size_t i = 0; i < calls.size(); i++) {
+                                    for (size_t i = 0; i < detected_tool_calls.size(); i++) {
                                         json tc = {
                                             {"index", (int)i},
                                             {"id", make_tool_call_id()},
                                             {"type", "function"},
                                             {"function", {
-                                                {"name", calls[i].name},
-                                                {"arguments", calls[i].arguments.dump()}
+                                                {"name", detected_tool_calls[i].name},
+                                                {"arguments", detected_tool_calls[i].arguments.dump()}
                                             }}
                                         };
                                         json delta = {{"tool_calls", json::array({tc})}};
@@ -353,6 +560,20 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                                         std::string data = "data: " + safe_dump(chunk) + "\n\n";
                                         sink.write(data.c_str(), data.size());
                                     }
+                                } else if (buffering_tool_call && !accumulated_text.empty()) {
+                                    // Tool-call text was malformed/incomplete.
+                                    // Fall back to normal text so clients don't receive an empty response.
+                                    json fallback_chunk = {
+                                        {"id", completion_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", created},
+                                        {"model", g_model_id},
+                                        {"choices", json::array({
+                                            {{"index", 0}, {"delta", {{"content", accumulated_text}}}, {"finish_reason", nullptr}}
+                                        })}
+                                    };
+                                    std::string fdata = "data: " + safe_dump(fallback_chunk) + "\n\n";
+                                    sink.write(fdata.c_str(), fdata.size());
                                 }
                             }
 
@@ -389,15 +610,36 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                             }
 
                             sink.write("data: [DONE]\n\n", 14);
-                            return;
+                            return true;
                         }
 
                         if (!r.text.empty()) {
-                            accumulated_text += r.text;
+                            if (has_tools) {
+                                accumulated_text += r.text;
 
-                            // If tools are present, buffer output (don't stream raw tool_call XML)
-                            if (has_tools && accumulated_text.find("<tool_call>") != std::string::npos) {
-                                return;
+                                if (!buffering_tool_call &&
+                                    (accumulated_text.find("<tool_call>") != std::string::npos ||
+                                     accumulated_text.find("<function=") != std::string::npos)) {
+                                    buffering_tool_call = true;
+                                }
+
+                                if (buffering_tool_call) {
+                                    // Parse opportunistically on every chunk so we can stop as soon as
+                                    // function name + at least one complete parameter is available.
+                                    auto calls = parse_tool_calls(accumulated_text);
+                                    if (!calls.empty()) {
+                                        bool complete = false;
+                                        for (auto& c : calls) {
+                                            if (call_is_complete(c)) { complete = true; break; }
+                                        }
+                                        if (complete) {
+                                            detected_tool_calls = std::move(calls);
+                                            tool_call_detected = true;
+                                            return false; // stop generation ASAP
+                                        }
+                                    }
+                                    return true;
+                                }
                             }
 
                             json chunk = {
@@ -412,6 +654,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                             std::string data = "data: " + safe_dump(chunk) + "\n\n";
                             sink.write(data.c_str(), data.size());
                         }
+                        return true;
                     },
                     tools_json);
 
@@ -429,13 +672,37 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
 
         std::string full_text;
         GenerationResponse last{};
+        bool tool_call_detected = false;
 
         stream_generate(*g_model, g_tokenizer, messages,
             max_tokens, enable_thinking, sampling,
-            [&](const GenerationResponse& r) {
-                if (r.token == -1) { last = r; return; }
-                if (!r.text.empty()) full_text += r.text;
+            [&, tool_required_count](const GenerationResponse& r) {
+                auto call_is_complete = [&tool_required_count](const ParsedToolCall& c) {
+                    auto it = tool_required_count.find(c.name);
+                    int required = (it == tool_required_count.end()) ? 0 : it->second;
+                    if (required <= 0) return true;
+                    return !c.arguments.empty();
+                };
+                if (r.token == -1) { last = r; return true; }
+                if (!r.text.empty()) {
+                    full_text += r.text;
+                    if (has_tools && !tool_call_detected &&
+                        (full_text.find("</tool_call>") != std::string::npos ||
+                         full_text.find("</function>") != std::string::npos)) {
+                        auto calls = parse_tool_calls(full_text);
+                        bool complete = false;
+                        for (auto& c : calls) {
+                            if (call_is_complete(c)) { complete = true; break; }
+                        }
+                        if (!calls.empty() && complete) {
+                            tool_call_detected = true;
+                            last = r;
+                            return false; // stop generation once tool call is complete
+                        }
+                    }
+                }
                 last = r;
+                return true;
             },
             tools_json);
 

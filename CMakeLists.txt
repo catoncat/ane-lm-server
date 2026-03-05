@@ -51,6 +51,7 @@ set(VENDOR_SOURCES
 set(CORE_SOURCES
     ${ANE_LM_DIR}/common.cpp
     ${ANE_LM_DIR}/core/safetensors.cpp
+    ${ANE_LM_DIR}/core/model_loader.cpp
     ${ANE_LM_DIR}/core/tokenizer.cpp
     ${ANE_LM_DIR}/core/cpu_ops.cpp
     ${ANE_LM_DIR}/core/sampling.cpp
@@ -61,6 +62,7 @@ set(CORE_SOURCES
 
 set(MODEL_SOURCES
     ${ANE_LM_DIR}/models/llm/qwen3_5.cpp
+    ${ANE_LM_DIR}/models/llm/qwen3.cpp
 )
 
 # --- Server executable ---

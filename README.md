@@ -41,21 +41,22 @@ open "build/ANE-LM Server.app"
 
 Then use the menu bar app:
 
-1. Click `Download Model` on first launch (choose HuggingFace or `hf-mirror`).
-2. After download completes, click `Start Server`.
-3. For next launches, if the model already exists, the app auto-starts the server.
-4. Copy API URL from the app UI (`http://127.0.0.1:8080/v1`).
+1. Select model preset (`Qwen3.5-0.8B` or `Qwen3-0.6B`) and mirror source.
+2. Download one or both models (parallel downloads are supported).
+3. Click `Start Server`, or switch model in app and click switch/restart.
+4. For next launches, if a model already exists, the app auto-starts.
+5. Copy API URL from the app UI (`http://127.0.0.1:8080/v1`).
 
-Default local model path used by the app:
+Default local model root used by the app:
 
-`~/Library/Application Support/ANELMServer/models/Qwen3.5-0.8B`
+`~/Library/Application Support/ANELMServer/models/`
 
 ## Client Setup
 
 Set your OpenAI-compatible client to:
 
 - Base URL: `http://127.0.0.1:8080/v1`
-- Model: `Qwen3.5-0.8B`
+- Model: selected app model (for example `Qwen3.5-0.8B` or `Qwen3-0.6B`)
 - API key: any value (or empty, depending on client)
 
 ## API Compatibility
@@ -104,7 +105,8 @@ CLI flags:
 
 ## Supported Models
 
-- Qwen3.5 (dense, text-only)  
+- Qwen3 (dense)
+- Qwen3.5 (dense, text-only)
   See [ANE-LM](https://github.com/johnmai-dev/ANE-LM) for upstream model support updates.
 
 ## Acknowledgments

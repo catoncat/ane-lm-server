@@ -9,6 +9,8 @@ class ServerManager: ObservableObject {
     @Published var isRunning = false
     @Published var statusText = "Stopped"
     @Published var lastError: String?
+    @Published var runningModelID: String?
+    @Published var runningModelLabel: String?
 
     let port: Int = 8080
     let host: String = "127.0.0.1"
@@ -20,6 +22,7 @@ class ServerManager: ObservableObject {
     private var isStarting = false
     private var process: Process?
     private var healthTimer: Timer?
+    private var stderrPipe: Pipe?
 
     var serverBinaryURL: URL {
         // Inside .app bundle: Contents/Resources/ane-lm-server
@@ -40,13 +43,14 @@ class ServerManager: ObservableObject {
             .appendingPathComponent("Resources/ane-lm-server")
     }
 
-    func start(modelPath: URL) {
+    func start(modelPath: URL, modelID: String? = nil, modelLabel: String? = nil) {
         guard !isRunning && !isStarting else { return }
         lastError = nil
         isStarting = true
 
         let binary = serverBinaryURL
         guard FileManager.default.fileExists(atPath: binary.path) else {
+            isStarting = false
             lastError = "Server binary not found"
             statusText = "Error: binary missing"
             return
@@ -67,8 +71,13 @@ class ServerManager: ObservableObject {
         ]
 
         let errPipe = Pipe()
+        errPipe.fileHandleForReading.readabilityHandler = { file in
+            // Drain stderr continuously to avoid pipe backpressure blocking the server process.
+            _ = file.availableData
+        }
         proc.standardError = errPipe
         proc.standardOutput = FileHandle.nullDevice
+        stderrPipe = errPipe
 
         proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
@@ -79,19 +88,34 @@ class ServerManager: ObservableObject {
                 } else {
                     self?.statusText = "Stopped"
                 }
+                self?.runningModelID = nil
+                self?.runningModelLabel = nil
                 self?.healthTimer?.invalidate()
+                self?.stderrPipe?.fileHandleForReading.readabilityHandler = nil
+                self?.stderrPipe = nil
             }
         }
 
         do {
             try proc.run()
             process = proc
+            runningModelID = modelID
+            runningModelLabel = modelLabel
             statusText = "Starting..."
             startHealthPolling()
         } catch {
             isStarting = false
+            runningModelID = nil
+            runningModelLabel = nil
             lastError = error.localizedDescription
             statusText = "Failed to start"
+        }
+    }
+
+    func restart(modelPath: URL, modelID: String? = nil, modelLabel: String? = nil) {
+        stop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.start(modelPath: modelPath, modelID: modelID, modelLabel: modelLabel)
         }
     }
 
@@ -100,8 +124,12 @@ class ServerManager: ObservableObject {
         healthTimer = nil
         process?.terminate()
         process = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe = nil
         isRunning = false
         isStarting = false
+        runningModelID = nil
+        runningModelLabel = nil
         statusText = "Stopped"
     }
 
@@ -131,5 +159,6 @@ class ServerManager: ObservableObject {
 
     deinit {
         process?.terminate()
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
     }
 }

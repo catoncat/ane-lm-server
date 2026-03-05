@@ -26,8 +26,12 @@ struct ANELMServerApp: App {
     }
 
     private func autoStartIfReady() {
-        if downloader.modelExists && !server.isRunning {
-            server.start(modelPath: downloader.modelPath)
-        }
+        guard !server.isRunning else { return }
+        guard let model = downloader.preferredAutoStartModel() else { return }
+        server.start(
+            modelPath: downloader.modelPath(for: model),
+            modelID: model.id,
+            modelLabel: model.label
+        )
     }
 }
