@@ -1,61 +1,75 @@
 # ane-lm-server
 
-OpenAI-compatible API server for [ANE-LM](https://github.com/johnmai-dev/ANE-LM) — run LLM inference on Apple Neural Engine with a standard HTTP API.
+OpenAI-compatible local API server for [ANE-LM](https://github.com/johnmai-dev/ANE-LM), packaged as a macOS menu bar app.
 
-## What is this?
+## What Is This?
 
-This project wraps ANE-LM into an HTTP server that speaks the OpenAI API protocol. Any client that supports the OpenAI API (ChatBox, Open WebUI, Cursor, custom apps, etc.) can connect directly.
+`ANE-LM Server.app` runs a local OpenAI-compatible endpoint backed by Apple Neural Engine (ANE).  
+You can connect ChatBox, Open WebUI, Cursor, or custom OpenAI clients to it.
 
-All inference runs on the **Apple Neural Engine (ANE)**, not CPU or GPU.
+All inference runs on **ANE** (Apple Silicon only).
+
 <img width="712" height="398" alt="image" src="https://github.com/user-attachments/assets/9dfd0377-55a5-433f-a98e-4a14eab3b9ea" />
 
 <img width="828" height="846" alt="image" src="https://github.com/user-attachments/assets/4728ae16-55ef-4762-b4cc-229dd534e170" />
 
-
-## Requirements
+## Requirements (App Usage)
 
 - macOS 13.0+
 - Apple Silicon (M1/M2/M3/M4/M5)
-- CMake 3.20+
-- A supported model in safetensors format (e.g. Qwen3.5-0.8B)
+- Internet access for first model download
+- A few GB of free disk space for model files
 
-## Quick Start
+If you build from source, also install:
+
+- Xcode Command Line Tools (`xcode-select --install`)
+- CMake 3.20+
+
+## Quick Start (App-First)
 
 ```bash
-# Clone with submodules
+# 1) Clone (submodule required)
 git clone --recursive https://github.com/catoncat/ane-lm-server.git
 cd ane-lm-server
 
-# Build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(sysctl -n hw.ncpu)
+# 2) Build macOS app bundle
+./build-app.sh
 
-# Download a model
-huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir ~/models/Qwen3.5-0.8B
-
-# Run
-./build/ane-lm-server --model ~/models/Qwen3.5-0.8B --port 8080
+# 3) Launch app
+open "build/ANE-LM Server.app"
 ```
 
-## API
+Then use the menu bar app:
 
-### `POST /v1/chat/completions`
+1. Click `Download Model` on first launch (choose HuggingFace or `hf-mirror`).
+2. After download completes, click `Start Server`.
+3. For next launches, if the model already exists, the app auto-starts the server.
+4. Copy API URL from the app UI (`http://127.0.0.1:8080/v1`).
 
-OpenAI-compatible chat completions. Supports both streaming (SSE) and non-streaming responses.
+Default local model path used by the app:
+
+`~/Library/Application Support/ANELMServer/models/Qwen3.5-0.8B`
+
+## Client Setup
+
+Set your OpenAI-compatible client to:
+
+- Base URL: `http://127.0.0.1:8080/v1`
+- Model: `Qwen3.5-0.8B`
+- API key: any value (or empty, depending on client)
+
+## API Compatibility
+
+Endpoints:
+
+- `POST /v1/chat/completions`
+- `GET /v1/models`
+- `GET /health`
+
+Example:
 
 ```bash
-# Non-streaming
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.5-0.8B",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "temperature": 0.7,
-    "max_tokens": 100
-  }'
-
-# Streaming
-curl -N http://localhost:8080/v1/chat/completions \
+curl -N http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen3.5-0.8B",
@@ -64,28 +78,21 @@ curl -N http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+## Optional: Run CLI Server Manually (Developer)
 
-### `GET /v1/models`
+If you want to bypass the app and run the binary directly:
 
-List available models.
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target ane-lm-server -j"$(sysctl -n hw.ncpu)"
 
-### `GET /health`
+./build/ane-lm-server \
+  --model "$HOME/Library/Application Support/ANELMServer/models/Qwen3.5-0.8B" \
+  --host 127.0.0.1 \
+  --port 8080
+```
 
-Health check endpoint.
-
-### Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `messages` | array | required | Chat messages `[{role, content}]` |
-| `stream` | bool | false | Enable SSE streaming |
-| `max_tokens` | int | 0 (unlimited) | Max tokens to generate |
-| `temperature` | float | 0.6 | Sampling temperature |
-| `repetition_penalty` | float | 1.2 | Repetition penalty (1.0 = off) |
-| `frequency_penalty` | float | 0.1 | Frequency penalty |
-| `enable_thinking` | bool | false | Enable reasoning mode |
-
-## CLI Options
+CLI flags:
 
 ```
 --model <path>     Path to model directory (required)
@@ -95,42 +102,16 @@ Health check endpoint.
 -v, --verbose      Show detailed initialization info
 ```
 
-## Run as macOS Service
-
-Install as a `launchd` user agent for auto-restart on crash:
-
-```bash
-# Edit the plist to set your model path
-cp service/com.ane-lm.server.plist ~/Library/LaunchAgents/
-
-# Load & start
-launchctl load ~/Library/LaunchAgents/com.ane-lm.server.plist
-launchctl start com.ane-lm.server
-
-# Stop & unload
-launchctl stop com.ane-lm.server
-launchctl unload ~/Library/LaunchAgents/com.ane-lm.server.plist
-```
-
-## Use with Clients
-
-Set the API Base URL in your client to:
-
-```
-http://127.0.0.1:8080/v1
-```
-
-No API key is required (any value works).
-
 ## Supported Models
 
-- Qwen3.5 (dense, text-only) — see [ANE-LM](https://github.com/johnmai-dev/ANE-LM) for updates
+- Qwen3.5 (dense, text-only)  
+  See [ANE-LM](https://github.com/johnmai-dev/ANE-LM) for upstream model support updates.
 
 ## Acknowledgments
 
-- [ANE-LM](https://github.com/johnmai-dev/ANE-LM) by John Mai — LLM inference on Apple Neural Engine
-- [cpp-httplib](https://github.com/yhirose/cpp-httplib) — Header-only C++ HTTP server
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) — Inspiration for the server design
+- [ANE-LM](https://github.com/johnmai-dev/ANE-LM) by John Mai
+- [cpp-httplib](https://github.com/yhirose/cpp-httplib)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
 
 ## License
 
